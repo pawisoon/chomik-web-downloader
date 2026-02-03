@@ -1,0 +1,14 @@
+services:
+  chomik-downloader:
+    build: .
+    ports:
+      - "8001:5000"
+    environment:
+      - PANEL_PASSWORD=${PANEL_PASSWORD:-}
+      - SECRET_KEY=${SECRET_KEY:-change-me}
+      - CHOMIK_USERNAME=${CHOMIK_USERNAME}
+      - CHOMIK_PASSWORD=${CHOMIK_PASSWORD}
+      - DOWNLOAD_FOLDER=/app/downloads
+    volumes:
+      - ./downloads:/app/downloads
+    restart: unless-stopped

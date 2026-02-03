@@ -1,0 +1,8 @@
+downloads/
+__pycache__/
+*.pyc
+.env
+.env.local
+debug_*.xml
+.venv/
+venv/
