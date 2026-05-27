@@ -37,8 +37,11 @@ class ChomikDownloader:
         
         # Session to keep connections alive (simulating Connection: Keep-Alive)
         self.session = requests.Session()
+        # Chomikuj returns a 14 KB HTML error page for video files when the
+        # User-Agent doesn't identify a ChomikBox-family client. Match the
+        # desktop ChomikBox UA so videos download as binary (verified live).
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0',
+            'User-Agent': 'Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.1; ChomikBox/2.0.7.9)',
             'Accept-Language': 'pl-PL,en,*'
         })
 
@@ -508,6 +511,22 @@ class ChomikDownloader:
                         except Exception:
                             pass
                     return
+                # Reject HTML responses — chomikuj serves a fake "success" HTML
+                # error page (~14 KB) when the request is rejected for non-
+                # technical reasons (UA blocked, quota exhausted, login lost).
+                ctype = (r.headers.get('content-type') or '').lower()
+                if 'text/html' in ctype:
+                    body = next(r.iter_content(chunk_size=4096), b'')
+                    snippet = body.decode('utf-8', errors='replace')[:200]
+                    self.log(f"ERROR: server returned HTML, not a file. Snippet: {snippet!r}", error=True)
+                    if os.path.exists(part_file):
+                        os.remove(part_file)
+                    if callback:
+                        try:
+                            callback(name, 'error', 'Serwer zwrócił HTML zamiast pliku', None)
+                        except Exception:
+                            pass
+                    return
                 total = int(r.headers.get('content-length', 0)) or size
                 written = existing_size if mode == 'ab' else 0
                 with open(part_file, mode) as f:
@@ -521,6 +540,16 @@ class ChomikDownloader:
                                     callback(name, 'downloading', f'Pobieranie... {pct}%', pct)
                                 except Exception:
                                     pass
+            # Sanity check: if expected size known and we got <50% — treat as
+            # failure (don't rename the .part). Catches truncated streams.
+            if size > 0 and written < size * 0.5 and not headers.get('Range'):
+                self.log(f"ERROR: only got {written} of {size} bytes. Aborting.", error=True)
+                if callback:
+                    try:
+                        callback(name, 'error', f'Niekompletne pobranie {written}/{size} B', None)
+                    except Exception:
+                        pass
+                return
             os.rename(part_file, dest)
             self.log("Done.")
             if callback:
