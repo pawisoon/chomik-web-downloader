@@ -1,6 +1,6 @@
 # Chomik Web Downloader
 
-A self-hosted web app for downloading files and folders from [chomikuj.pl](https://chomikuj.pl) to your NAS or server. Paste a folder URL, pick your options, and watch real-time progress in the browser. Also ships with a CLI for scripting.
+A self-hosted web app for downloading files and folders from [chomikuj.pl](https://chomikuj.pl) directly to your NAS. Built with Synology in mind, but it runs anywhere Docker does. Paste a folder URL, pick your options, and watch real-time progress in the browser. Also ships with a CLI for scripting.
 
 Built with Python 3 and Flask. Runs as a Docker container or standalone.
 
