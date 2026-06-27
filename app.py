@@ -10,8 +10,9 @@ import hashlib
 import hmac
 import threading
 import uuid
+from datetime import datetime
 from functools import wraps
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote_plus
 
 from flask import Flask, request, redirect, render_template_string, Response, session
 
@@ -32,9 +33,107 @@ CHOMIK_USER = os.environ.get('CHOMIK_USERNAME', '')
 CHOMIK_PASS = os.environ.get('CHOMIK_PASSWORD', '')
 DOWNLOAD_BASE = os.environ.get('DOWNLOAD_FOLDER', '/app/downloads')
 
-# Per-job status: job_id -> { 'files': [ {name, status, message, percent}, ... ], 'done': bool, 'error': str }
+# Where job history is persisted (survives server restart). Lives under the
+# downloads bind mount by default so it persists across container recreation.
+STATE_FILE = os.environ.get('STATE_FILE', os.path.join(DOWNLOAD_BASE, 'jobs_state.json'))
+# Max retained jobs; oldest *done* jobs are pruned beyond this.
+MAX_JOBS = int(os.environ.get('MAX_JOBS', '50'))
+
+# Per-job status: job_id -> {
+#   'job_id', 'label', 'url', 'dest_folder', 'options': {recursive,structure,overwrite},
+#   'created_at', 'files': [ {name, size, status, message, percent}, ... ],
+#   'done': bool, 'error': str|None, 'interrupted': bool }
 download_status = {}
 download_lock = threading.Lock()
+
+_state_initialized = False
+
+
+# ---------- Persistence (single process; all access under download_lock) ----------
+
+def prune_jobs():
+    """Drop oldest *done* jobs beyond MAX_JOBS. Never prunes a running job.
+    Must be called while holding download_lock."""
+    if len(download_status) <= MAX_JOBS:
+        return
+    done_ids = [jid for jid, st in download_status.items() if st.get('done')]
+    done_ids.sort(key=lambda jid: download_status[jid].get('created_at') or '')
+    while len(download_status) > MAX_JOBS and done_ids:
+        del download_status[done_ids.pop(0)]
+
+
+def persist_state():
+    """Atomically write a snapshot of all jobs to STATE_FILE.
+    Must be called while holding download_lock. Never raises — a failed
+    snapshot must not crash an in-flight download."""
+    try:
+        prune_jobs()
+        payload = json.dumps({'version': 1, 'jobs': download_status})
+        tmp = STATE_FILE + '.tmp'
+        d = os.path.dirname(STATE_FILE)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(tmp, 'w') as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        app.logger.warning('Nie udało się zapisać stanu zadań: %s', e)
+
+
+def load_state():
+    """Read STATE_FILE -> dict of job_id -> job. Tolerates a missing or
+    corrupt file (returns {} and quarantines the bad file)."""
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE, 'r') as f:
+            data = json.load(f)
+        jobs = data.get('jobs', {})
+        if isinstance(jobs, dict):
+            return jobs
+        app.logger.warning('jobs_state.json ma nieoczekiwany format; ignoruję')
+        return {}
+    except Exception as e:
+        app.logger.warning('Uszkodzony plik stanu (%s); przenoszę do .corrupt', e)
+        try:
+            os.replace(STATE_FILE, STATE_FILE + '.corrupt')
+        except Exception:
+            pass
+        return {}
+
+
+def init_state():
+    """Load persisted jobs and reconcile any that were running when the server
+    stopped: the daemon thread is gone, so mark them interrupted. Idempotent."""
+    global _state_initialized
+    with download_lock:
+        if _state_initialized:
+            return
+        jobs = load_state()
+        download_status.clear()
+        download_status.update(jobs)
+        for st in download_status.values():
+            if not st.get('done'):
+                st['done'] = True
+                st['interrupted'] = True
+                if not st.get('error'):
+                    st['error'] = u'Pobieranie przerwane (restart serwera)'
+        _state_initialized = True
+        persist_state()
+
+
+def derive_label(url):
+    """Human label from a chomikuj URL: last 1-2 path segments, URL-decoded."""
+    try:
+        path = urlparse(url).path
+        parts = [unquote_plus(p) for p in path.split('/') if p]
+        if parts:
+            return '/'.join(parts[-2:])
+    except Exception:
+        pass
+    return url
 
 
 def verify_password(password):
@@ -267,6 +366,50 @@ HTML_FORM = u"""
         .status-success { color: #28a745; }
         .status-error { color: #dc3545; }
         .status-pending { color: #ffc107; }
+        .job-card {
+            background: #fff;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            padding: 15px;
+            margin: 15px 0;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+        }
+        .job-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 10px;
+        }
+        .job-title { font-weight: bold; color: #333; word-break: break-all; }
+        .job-meta { font-size: 12px; color: #999; margin-top: 2px; }
+        .job-head-left { min-width: 0; }
+        .job-head-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            white-space: nowrap;
+        }
+        .status-badge.running { background: #e3f2fd; color: #1565c0; }
+        .status-badge.done { background: #d4edda; color: #155724; }
+        .status-badge.error { background: #f8d7da; color: #721c24; }
+        .status-badge.interrupted { background: #fff3cd; color: #856404; }
+        .rerun-btn {
+            background: #6c757d;
+            color: white;
+            padding: 6px 12px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            margin: 0;
+        }
+        .rerun-btn:hover { background: #5a6268; }
+        .job-error { font-size: 13px; color: #721c24; margin-top: 6px; }
         .messages { margin: 20px 0; }
         .alert {
             padding: 12px;
@@ -317,7 +460,7 @@ HTML_FORM = u"""
             <button type="submit" id="startBtn">Rozpocznij pobieranie</button>
         </form>
         <div class="file-list">
-            <h2>Status pobierania</h2>
+            <h2>Zadania pobierania</h2>
             <div id="statusList"></div>
         </div>
     </div>
@@ -333,20 +476,83 @@ HTML_FORM = u"""
             el.textContent = msg;
             document.getElementById('messages').appendChild(el);
         }
-        function addFileStatus(name, size) {
-            const sizeStr = size >= 1024*1024 ? (size/1024/1024).toFixed(2) + ' MB' : (size/1024).toFixed(2) + ' KB';
-            const id = 's-' + name.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 40);
+        function slug(name) { return name.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 40); }
+        function fileElId(jobId, name) { return 'j-' + jobId + '-s-' + slug(name); }
+        function fmtSize(size) {
+            return size >= 1024*1024 ? (size/1024/1024).toFixed(2) + ' MB' : (size/1024).toFixed(2) + ' KB';
+        }
+        function fmtDate(iso) {
+            if (!iso) return '';
+            return String(iso).replace('T', ' ').slice(0, 19);
+        }
+        function jobState(job) {
+            if (!job.done) return { cls: 'running', text: 'W toku' };
+            if (job.interrupted) return { cls: 'interrupted', text: 'Przerwane' };
+            if (job.error) return { cls: 'error', text: 'Błąd' };
+            return { cls: 'done', text: 'Zakończone' };
+        }
+        function renderJobCard(job, prepend) {
+            const jobId = job.job_id;
+            if (!jobId) return null;
+            let card = document.getElementById('job-' + jobId);
+            if (!card) {
+                card = document.createElement('div');
+                card.className = 'job-card';
+                card.id = 'job-' + jobId;
+                card.innerHTML =
+                    '<div class="job-header">' +
+                        '<div class="job-head-left">' +
+                            '<div class="job-title">' + escapeHtml(job.label || job.url || jobId) + '</div>' +
+                            '<div class="job-meta" id="meta-' + jobId + '"></div>' +
+                        '</div>' +
+                        '<div class="job-head-right">' +
+                            '<span class="status-badge" id="badge-' + jobId + '"></span>' +
+                            '<button class="rerun-btn" id="rerun-' + jobId + '" style="display:none;">Uruchom ponownie</button>' +
+                        '</div>' +
+                    '</div>' +
+                    '<div class="job-error" id="err-' + jobId + '" style="display:none;"></div>' +
+                    '<div class="job-files" id="files-' + jobId + '"></div>';
+                const list = document.getElementById('statusList');
+                if (prepend && list.firstChild) list.insertBefore(card, list.firstChild);
+                else list.appendChild(card);
+                document.getElementById('rerun-' + jobId).addEventListener('click', function () {
+                    rerunJob(card._job || job);
+                });
+            }
+            card._job = job;
+            const meta = document.getElementById('meta-' + jobId);
+            if (meta) {
+                let m = fmtDate(job.created_at);
+                if (job.dest_folder) m += (m ? ' • ' : '') + 'do: ' + escapeHtml(job.dest_folder);
+                meta.innerHTML = m;
+            }
+            const st = jobState(job);
+            const badge = document.getElementById('badge-' + jobId);
+            if (badge) { badge.className = 'status-badge ' + st.cls; badge.textContent = st.text; }
+            const rerun = document.getElementById('rerun-' + jobId);
+            if (rerun) rerun.style.display = job.done ? 'inline-block' : 'none';
+            const err = document.getElementById('err-' + jobId);
+            if (err) {
+                if (job.error) { err.style.display = 'block'; err.textContent = job.error; }
+                else err.style.display = 'none';
+            }
+            return card;
+        }
+        function addFileStatus(jobId, name, size) {
+            const id = fileElId(jobId, name);
+            if (document.getElementById(id)) return;
             const div = document.createElement('div');
             div.className = 'file-item pending';
             div.id = id;
             div.innerHTML = '<div class="file-name">' + escapeHtml(name) + '</div>' +
-                '<div class="file-size">Rozmiar: ' + sizeStr + '</div>' +
+                '<div class="file-size">Rozmiar: ' + fmtSize(size) + '</div>' +
                 '<div class="progress-bar"><div class="progress-fill" id="' + id + '-p">0%</div></div>' +
                 '<div class="status-text status-pending" id="' + id + '-t">Oczekiwanie...</div>';
-            document.getElementById('statusList').appendChild(div);
+            const container = document.getElementById('files-' + jobId);
+            if (container) container.appendChild(div);
         }
-        function updateFileStatus(name, status, message, percent) {
-            const id = 's-' + name.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 40);
+        function updateFileStatus(jobId, name, status, message, percent) {
+            const id = fileElId(jobId, name);
             const el = document.getElementById(id);
             if (!el) return;
             const p = document.getElementById(id + '-p');
@@ -356,59 +562,88 @@ HTML_FORM = u"""
             el.className = 'file-item ' + (status === 'success' ? 'success' : status === 'error' ? 'error' : 'pending');
             if (t) t.className = 'status-text ' + (status === 'success' ? 'status-success' : status === 'error' ? 'status-error' : 'status-pending');
         }
+        function applyJobFiles(job) {
+            if (!job.files) return;
+            job.files.forEach(function (f) {
+                addFileStatus(job.job_id, f.name, f.size || 0);
+                updateFileStatus(job.job_id, f.name, f.status, f.message || '', f.percent != null ? f.percent : 0);
+            });
+        }
+        function postDownload(payload) {
+            document.getElementById('startBtn').disabled = true;
+            return fetch('/api/download', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('startBtn').disabled = false;
+                if (data.error) { showMessage(data.error, 'error'); return; }
+                showMessage('Pobieranie rozpoczęte.', 'success');
+                renderJobCard({
+                    job_id: data.job_id, label: payload.url, url: payload.url,
+                    dest_folder: payload.destFolder || '', created_at: null,
+                    files: [], done: false, error: null, interrupted: false
+                }, true);
+                pollStatus(data.job_id);
+            })
+            .catch(err => {
+                document.getElementById('startBtn').disabled = false;
+                showMessage('Błąd: ' + err.message, 'error');
+            });
+        }
         function startDownload(e) {
             e.preventDefault();
             const url = document.getElementById('folderUrl').value.trim();
             const dest = document.getElementById('destFolder').value.trim();
-            const recursive = document.getElementById('recursive').checked;
-            const structure = document.getElementById('structure').checked;
-            const overwrite = document.getElementById('overwrite').checked;
             document.getElementById('messages').innerHTML = '';
-            document.getElementById('statusList').innerHTML = '';
-            document.getElementById('startBtn').disabled = true;
-            fetch('/api/download', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url: url, destFolder: dest || undefined, recursive, structure, overwrite })
-            })
-            .then(r => r.json())
-            .then(data => {
-                if (data.error) {
-                    showMessage(data.error, 'error');
-                    document.getElementById('startBtn').disabled = false;
-                    return;
-                }
-                showMessage('Pobieranie rozpoczęte. Odświeżam status...', 'success');
-                pollStatus(data.job_id, data.job_id);
-            })
-            .catch(err => {
-                showMessage('Błąd: ' + err.message, 'error');
-                document.getElementById('startBtn').disabled = false;
+            postDownload({
+                url: url,
+                destFolder: dest || undefined,
+                recursive: document.getElementById('recursive').checked,
+                structure: document.getElementById('structure').checked,
+                overwrite: document.getElementById('overwrite').checked
             });
         }
-        function pollStatus(jobId, _first) {
+        function rerunJob(job) {
+            const opts = job.options || {};
+            document.getElementById('messages').innerHTML = '';
+            postDownload({
+                url: job.url,
+                destFolder: job.dest_folder || undefined,
+                recursive: opts.recursive !== false,
+                structure: opts.structure !== false,
+                overwrite: !!opts.overwrite
+            });
+        }
+        function pollStatus(jobId) {
             fetch('/api/status/' + jobId)
             .then(r => r.json())
             .then(data => {
-                if (data.files && data.files.length) {
-                    data.files.forEach(function (f) {
-                        let el = document.getElementById('s-' + f.name.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 40));
-                        if (!el) addFileStatus(f.name, f.size || 0);
-                        updateFileStatus(f.name, f.status, f.message || '', f.percent != null ? f.percent : 0);
-                    });
-                }
-                if (data.done) {
-                    document.getElementById('startBtn').disabled = false;
-                    if (data.error) showMessage(data.error, 'error');
-                    else showMessage('Pobieranie zakończone.', 'success');
-                    return;
-                }
-                setTimeout(function() { pollStatus(jobId); }, 1500);
+                data.job_id = data.job_id || jobId;
+                renderJobCard(data);
+                applyJobFiles(data);
+                if (data.done) return;
+                setTimeout(function () { pollStatus(jobId); }, 1500);
             })
-            .catch(function() {
-                setTimeout(function() { pollStatus(jobId); }, 2000);
+            .catch(function () {
+                setTimeout(function () { pollStatus(jobId); }, 2000);
             });
         }
+        function loadJobs() {
+            fetch('/api/jobs')
+            .then(r => r.json())
+            .then(data => {
+                (data.jobs || []).forEach(function (job) {
+                    renderJobCard(job);
+                    applyJobFiles(job);
+                    if (!job.done) pollStatus(job.job_id);
+                });
+            })
+            .catch(function () {});
+        }
+        document.addEventListener('DOMContentLoaded', loadJobs);
     </script>
 </body>
 </html>
@@ -459,15 +694,32 @@ def api_download():
         except Exception as e:
             return json_response({'error': 'Nie można utworzyć folderu: ' + str(e)}, 200)
 
+        recursive = bool(data.get('recursive', True))
+        structure = bool(data.get('structure', True))
+        overwrite = bool(data.get('overwrite', False))
+
         job_id = str(uuid.uuid4())
         with download_lock:
-            download_status[job_id] = {'files': [], 'done': False, 'error': None}
+            download_status[job_id] = {
+                'job_id': job_id,
+                'label': derive_label(url),
+                'url': url,
+                'dest_folder': dest_folder,
+                'options': {'recursive': recursive, 'structure': structure, 'overwrite': overwrite},
+                'created_at': datetime.now().isoformat(),
+                'files': [],
+                'done': False,
+                'error': None,
+                'interrupted': False,
+            }
+            persist_state()
 
         def on_files_listed(files):
             with download_lock:
                 st = download_status.get(job_id)
                 if st and not st['done']:
                     st['files'] = [{'name': f['name'], 'size': f['size'], 'status': 'pending', 'message': 'Oczekiwanie...', 'percent': 0} for f in files]
+                    persist_state()
 
         def progress_callback(name, status, message, percent):
             with download_lock:
@@ -476,9 +728,13 @@ def api_download():
                     return
                 for f in st['files']:
                     if f['name'] == name:
+                        changed = f['status'] != status
                         f['status'] = status
                         f['message'] = message
                         f['percent'] = percent if percent is not None else f.get('percent', 0)
+                        # Persist only on terminal transitions, never per-chunk 'downloading' ticks.
+                        if changed and status in ('success', 'error'):
+                            persist_state()
                         break
 
         class Args(object):
@@ -488,9 +744,9 @@ def api_download():
         args.password = CHOMIK_PASS
         args.hash = None
         args.url = url
-        args.recursive = bool(data.get('recursive', True))
-        args.structure = bool(data.get('structure', True))
-        args.overwrite = bool(data.get('overwrite', False))
+        args.recursive = recursive
+        args.structure = structure
+        args.overwrite = overwrite
         args.noprogress = True
         args.ext = None
         args.max_limit = None
@@ -507,10 +763,12 @@ def api_download():
                     if st:
                         st['error'] = str(e)
                         st['done'] = True
+                        persist_state()
             with download_lock:
                 st = download_status.get(job_id)
                 if st:
                     st['done'] = True
+                    persist_state()
 
         t = threading.Thread(target=run)
         t.daemon = True
@@ -531,6 +789,21 @@ def api_status(job_id):
     return json_response(st)
 
 
+@app.route('/api/jobs')
+@login_required
+def api_jobs():
+    with download_lock:
+        jobs = list(download_status.values())
+    jobs.sort(key=lambda st: st.get('created_at') or '', reverse=True)
+    return json_response({'jobs': jobs})
+
+
+# Reconcile persisted jobs at import time so any WSGI entrypoint sees them too
+# (idempotent — guarded by _state_initialized).
+init_state()
+
+
 if __name__ == '__main__':
     os.makedirs(DOWNLOAD_BASE, exist_ok=True)
+    init_state()
     app.run(host='0.0.0.0', port=5000)

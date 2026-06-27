@@ -143,6 +143,15 @@ downloads/
 | `PANEL_PASSWORD` | No | (none) | Web panel password; omit to disable login |
 | `SECRET_KEY` | No | `change-me` | Flask session secret |
 | `DOWNLOAD_FOLDER` | No | `/app/downloads` | Where files are saved |
+| `STATE_FILE` | No | `<DOWNLOAD_FOLDER>/jobs_state.json` | Job history file; keep it on persistent storage so jobs survive a restart |
+| `MAX_JOBS` | No | `50` | Max retained jobs; oldest *finished* jobs are pruned beyond this |
+
+> **Job history & restarts.** Jobs are persisted to `STATE_FILE`, so closing the browser tab and
+> reopening it shows running and past jobs (the page reconnects automatically — no localStorage). A
+> server restart kills the in-flight download thread, so any job that was running is marked
+> **Przerwane** (interrupted) on next boot; use **Uruchom ponownie** (re-run) to restart it —
+> partially downloaded files resume at byte level via existing `.part` files. Run a single process
+> (the default `python app.py`); a multi-worker WSGI setup would each keep separate state.
 
 ---
 
