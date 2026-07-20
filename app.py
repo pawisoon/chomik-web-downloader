@@ -409,6 +409,17 @@ HTML_FORM = u"""
             margin: 0;
         }
         .rerun-btn:hover { background: #5a6268; }
+        .delete-btn {
+            background: #dc3545;
+            color: white;
+            padding: 6px 12px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            margin: 0;
+        }
+        .delete-btn:hover { background: #c82333; }
         .job-error { font-size: 13px; color: #721c24; margin-top: 6px; }
         .messages { margin: 20px 0; }
         .alert {
@@ -508,6 +519,7 @@ HTML_FORM = u"""
                         '<div class="job-head-right">' +
                             '<span class="status-badge" id="badge-' + jobId + '"></span>' +
                             '<button class="rerun-btn" id="rerun-' + jobId + '" style="display:none;">Uruchom ponownie</button>' +
+                            '<button class="delete-btn" id="del-' + jobId + '" style="display:none;">Usuń</button>' +
                         '</div>' +
                     '</div>' +
                     '<div class="job-error" id="err-' + jobId + '" style="display:none;"></div>' +
@@ -517,6 +529,9 @@ HTML_FORM = u"""
                 else list.appendChild(card);
                 document.getElementById('rerun-' + jobId).addEventListener('click', function () {
                     rerunJob(card._job || job);
+                });
+                document.getElementById('del-' + jobId).addEventListener('click', function () {
+                    deleteJob(card._job || job);
                 });
             }
             card._job = job;
@@ -531,6 +546,8 @@ HTML_FORM = u"""
             if (badge) { badge.className = 'status-badge ' + st.cls; badge.textContent = st.text; }
             const rerun = document.getElementById('rerun-' + jobId);
             if (rerun) rerun.style.display = job.done ? 'inline-block' : 'none';
+            const del = document.getElementById('del-' + jobId);
+            if (del) del.style.display = job.done ? 'inline-block' : 'none';
             const err = document.getElementById('err-' + jobId);
             if (err) {
                 if (job.error) { err.style.display = 'block'; err.textContent = job.error; }
@@ -614,8 +631,21 @@ HTML_FORM = u"""
                 destFolder: job.dest_folder || undefined,
                 recursive: opts.recursive !== false,
                 structure: opts.structure !== false,
-                overwrite: !!opts.overwrite
+                overwrite: !!opts.overwrite,
+                rerunId: job.job_id
             });
+        }
+        function deleteJob(job) {
+            if (!job || !job.job_id) return;
+            if (!confirm('Usunąć to zadanie z historii? Pobrane pliki na dysku pozostaną nienaruszone.')) return;
+            fetch('/api/jobs/' + job.job_id, { method: 'DELETE' })
+            .then(r => r.json())
+            .then(data => {
+                if (data && data.error) { showMessage(data.error, 'error'); return; }
+                const card = document.getElementById('job-' + job.job_id);
+                if (card) card.remove();
+            })
+            .catch(err => showMessage('Błąd: ' + err.message, 'error'));
         }
         function pollStatus(jobId) {
             fetch('/api/status/' + jobId)
@@ -698,20 +728,39 @@ def api_download():
         structure = bool(data.get('structure', True))
         overwrite = bool(data.get('overwrite', False))
 
-        job_id = str(uuid.uuid4())
+        # "Uruchom ponownie" passes rerunId so a re-run resets the *same* entry
+        # instead of minting a new job and orphaning the old card. Falls back to a
+        # fresh job if the id is unknown (e.g. the entry was deleted or pruned).
+        rerun_id = (data.get('rerunId') or '').strip()
         with download_lock:
-            download_status[job_id] = {
-                'job_id': job_id,
-                'label': derive_label(url),
-                'url': url,
-                'dest_folder': dest_folder,
-                'options': {'recursive': recursive, 'structure': structure, 'overwrite': overwrite},
-                'created_at': datetime.now().isoformat(),
-                'files': [],
-                'done': False,
-                'error': None,
-                'interrupted': False,
-            }
+            existing = download_status.get(rerun_id) if rerun_id else None
+            if existing and existing.get('done'):
+                job_id = rerun_id
+                existing.update({
+                    'label': derive_label(url),
+                    'url': url,
+                    'dest_folder': dest_folder,
+                    'options': {'recursive': recursive, 'structure': structure, 'overwrite': overwrite},
+                    'created_at': datetime.now().isoformat(),
+                    'files': [],
+                    'done': False,
+                    'error': None,
+                    'interrupted': False,
+                })
+            else:
+                job_id = str(uuid.uuid4())
+                download_status[job_id] = {
+                    'job_id': job_id,
+                    'label': derive_label(url),
+                    'url': url,
+                    'dest_folder': dest_folder,
+                    'options': {'recursive': recursive, 'structure': structure, 'overwrite': overwrite},
+                    'created_at': datetime.now().isoformat(),
+                    'files': [],
+                    'done': False,
+                    'error': None,
+                    'interrupted': False,
+                }
             persist_state()
 
         def on_files_listed(files):
@@ -796,6 +845,21 @@ def api_jobs():
         jobs = list(download_status.values())
     jobs.sort(key=lambda st: st.get('created_at') or '', reverse=True)
     return json_response({'jobs': jobs})
+
+
+@app.route('/api/jobs/<job_id>', methods=['DELETE'])
+@login_required
+def api_delete_job(job_id):
+    """Remove a finished job from the history. Downloaded files are untouched."""
+    with download_lock:
+        st = download_status.get(job_id)
+        if not st:
+            return json_response({'error': 'Nieznane zadanie'}, 404)
+        if not st.get('done'):
+            return json_response({'error': 'Nie można usunąć trwającego zadania'}, 409)
+        download_status.pop(job_id, None)
+        persist_state()
+    return json_response({'ok': True})
 
 
 # Reconcile persisted jobs at import time so any WSGI entrypoint sees them too
