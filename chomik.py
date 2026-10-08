@@ -18,6 +18,10 @@ class ChomikDownloader:
     Chomikuj file downloader class ported from PHP.
     """
 
+    # Per-file attempts when chomikuj withholds the URL or serves HTML.
+    MAX_ATTEMPTS = 3
+    RETRY_DELAYS = (15, 60)
+
     def __init__(self, args):
         self.args = args
         self.user_name = args.user
@@ -265,138 +269,34 @@ class ChomikDownloader:
         # 1. Get Metadata
         files_info = self.download_files_information(urls)
 
-        # 2. Iterate and Download
-        iteration_size = 1 
-        chunks = [files_info[i:i + iteration_size] for i in range(0, len(files_info), iteration_size)]
+        # 2. Iterate and Download, one file per request. Chomikuj sometimes
+        # withholds the download URL (or serves an HTML page instead of the
+        # file) when the account is busy, e.g. while another download is
+        # streaming. Retry those cases instead of silently dropping the file.
+        for i, file_info in enumerate(files_info):
+            self.log(f"  Download iteration {i + 1} / {len(files_info)}")
+            name = file_info['name']
+            reason = None
 
-        for i, chunk in enumerate(chunks):
-            self.log(f"  Download iteration {i + 1} / {len(chunks)}")
-            
-            entries = ''
-            for file_info in chunk:
-                entries += f"<DownloadReqEntry><id>{file_info['id']}</id><agreementInfo><AgreementInfo><name>{file_info['agreement']}</name>"
-                if file_info['agreement'] != 'small':
-                    entries += f"<cost>{file_info['cost']}</cost>"
-                entries += "</AgreementInfo></agreementInfo></DownloadReqEntry>"
+            for attempt in range(self.MAX_ATTEMPTS):
+                if attempt:
+                    delay = self.RETRY_DELAYS[min(attempt - 1, len(self.RETRY_DELAYS) - 1)]
+                    self.log(f"  Retrying \"{name}\" in {delay}s ({reason}).")
+                    self._notify(name, 'pending',
+                                 f'Ponawianie za {delay}s ({attempt + 1}/{self.MAX_ATTEMPTS}): {reason}', 0)
+                    time.sleep(delay)
 
-            self.stamp += 1
-            xml_data = (
-                '<?xml version="1.0" encoding="UTF-8"?>'
-                '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
-                's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
-                '<s:Body>'
-                '<Download xmlns="http://chomikuj.pl/">'
-                f'<token>{self.auth_token}</token>'
-                '<sequence>'
-                f'<stamp>{self.stamp}</stamp>'
-                '<part>0</part>'
-                '<count>1</count>'
-                '</sequence>'
-                '<disposition>download</disposition>'
-                '<list>'
-                f'{entries}'
-                '</list>'
-                '</Download>'
-                '</s:Body>'
-                '</s:Envelope>'
-            )
-
-            # Debug: persist request XML for troubleshooting
-            try:
-                debug_req_path = os.path.join(os.getcwd(), "debug_download_files_request.xml")
-                with open(debug_req_path, "w", encoding="utf-8") as f:
-                    f.write(xml_data)
-            except Exception:
-                pass
-
-            headers = {
-                'SOAPAction': 'http://chomikuj.pl/IChomikBoxService/Download',
-                'Content-Type': 'text/xml;charset=utf-8',
-            }
-
-            response = self._request('https://box.chomikuj.pl/services/ChomikBoxService.svc',
-                                     method='POST', data=xml_data, headers=headers)
-
-            # Debug: persist raw response from download request
-            try:
-                debug_path = os.path.join(os.getcwd(), "debug_download_files.xml")
-                with open(debug_path, "w", encoding="utf-8") as f:
-                    f.write(response or "")
-            except Exception:
-                pass
-
-            global_id_match = re.search(r'<globalId>(.*?)</globalId>', response or '')
-            path_prefix = ''
-            if global_id_match:
-                raw_path = global_id_match.group(1)  # e.g. /Pepe2020/Ebooki/File.ext
-                # Strip leading slash.
-                raw_path = raw_path.lstrip('/')
-                # Use only the directory component (drop the filename itself).
-                dir_part = os.path.dirname(raw_path)
-                # Remove non-ASCII noise just in case.
-                path_prefix = re.sub(r'[^\x20-\x7F]', '', dir_part)
-
-            # Parse actual download URLs from FileEntry.
-            # IMPORTANT: Match <name> tags ONLY inside <FileEntry>, not outer <DownloadFolder><name>.
-            # realId can be i:nil="true", so we ignore it and just pick:
-            #   - numeric id
-            #   - file name
-            #   - size
-            #   - optional url (may be nil)
-            file_pattern = re.compile(
-                r'<FileEntry[^>]*>.*?'
-                r'<id>(\d+)</id>.*?'
-                r'(?:<realId[^>]*/>|</realId>).*?'
-                r'<name>(.*?)</name><size>(\d+)</size>.*?'
-                r'(?:<url i:nil="true"\s*/>|<url>(.*?)</url>).*?'
-                r'</FileEntry>',
-                re.DOTALL
-            )
-
-            download_targets = []
-            for fid, name, size, url_val in file_pattern.findall(response or ''):
-                # Sanitize filename: remove any XML-like tags that might have leaked in.
-                name = re.sub(r'<[^>]+>', '', name).strip()
-                # Remove any leading/trailing XML fragments.
-                name = re.sub(r'^[<>/]+', '', name)
-                name = re.sub(r'[<>/]+$', '', name)
-                size = int(size)
-
-                ext = os.path.splitext(name)[1].lstrip('.').lower()
-                if self.exts and ext not in [e.lower() for e in self.exts]:
-                    continue
-                if self.args.max_limit and size > int(self.args.max_limit):
+                target, reason = self._request_download_target(file_info, destination_folder)
+                if not target:
                     continue
 
-                if not url_val:
-                    # No direct download URL for this entry.
-                    continue
-
-                final_url = html.unescape(url_val)
-
-                # Sanitize filename for filesystem safety (remove invalid chars for macOS/Windows/Linux).
-                safe_name = re.sub(r'[<>:"|?*\x00-\x1f]', '_', name)
-                # Remove any leading dots or spaces that could cause issues.
-                safe_name = safe_name.lstrip('. ')
-
-                dest_dir = destination_folder
-                if self.args.structure and path_prefix:
-                    # Sanitize path_prefix to ensure it's a valid directory name.
-                    path_prefix = re.sub(r'[<>:"|?*\x00-\x1f]', '_', path_prefix)
-                    path_prefix = path_prefix.strip('. ')
-                    dest_dir = os.path.join(destination_folder, path_prefix)
-
-                full_path = os.path.join(dest_dir, safe_name)
-
-                download_targets.append({
-                    'name': name,
-                    'size': size,
-                    'url': final_url,
-                    'destination': full_path
-                })
-
-            for target in download_targets:
-                self._download_binary(target)
+                result = self._download_binary(target)
+                if result != 'retry':
+                    break
+                reason = 'Serwer zwrócił HTML zamiast pliku'
+            else:
+                self.log(f"ERROR: giving up on \"{name}\": {reason}", error=True)
+                self._notify(name, 'error', reason, None)
 
         # 3. Handle Recursion
         if self.args.recursive:
@@ -435,8 +335,154 @@ class ChomikDownloader:
                     if sub_urls:
                         self.download_files(sub_urls, destination_folder)
 
+    def _notify(self, name, status, message, percent):
+        """Forward a per-file status update to the optional progress callback."""
+        callback = getattr(self.args, 'progress_callback', None)
+        if callback:
+            try:
+                callback(name, status, message, percent)
+            except Exception:
+                pass
+
+    def _request_download_target(self, file_info, destination_folder):
+        """
+        Asks the service for a direct download URL of a single file.
+        Returns (target, None) on success or (None, reason) when the service
+        did not hand out a URL.
+        """
+        if not self.login():
+            return None, 'Logowanie do chomikuj nie powiodło się'
+
+        entries = f"<DownloadReqEntry><id>{file_info['id']}</id><agreementInfo><AgreementInfo><name>{file_info['agreement']}</name>"
+        if file_info['agreement'] != 'small':
+            entries += f"<cost>{file_info['cost']}</cost>"
+        entries += "</AgreementInfo></agreementInfo></DownloadReqEntry>"
+
+        self.stamp += 1
+        xml_data = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+            '<s:Body>'
+            '<Download xmlns="http://chomikuj.pl/">'
+            f'<token>{self.auth_token}</token>'
+            '<sequence>'
+            f'<stamp>{self.stamp}</stamp>'
+            '<part>0</part>'
+            '<count>1</count>'
+            '</sequence>'
+            '<disposition>download</disposition>'
+            '<list>'
+            f'{entries}'
+            '</list>'
+            '</Download>'
+            '</s:Body>'
+            '</s:Envelope>'
+        )
+
+        # Debug: persist request XML for troubleshooting
+        try:
+            debug_req_path = os.path.join(os.getcwd(), "debug_download_files_request.xml")
+            with open(debug_req_path, "w", encoding="utf-8") as f:
+                f.write(xml_data)
+        except Exception:
+            pass
+
+        headers = {
+            'SOAPAction': 'http://chomikuj.pl/IChomikBoxService/Download',
+            'Content-Type': 'text/xml;charset=utf-8',
+        }
+
+        response = self._request('https://box.chomikuj.pl/services/ChomikBoxService.svc',
+                                 method='POST', data=xml_data, headers=headers)
+
+        # Debug: persist raw response from download request
+        try:
+            debug_path = os.path.join(os.getcwd(), "debug_download_files.xml")
+            with open(debug_path, "w", encoding="utf-8") as f:
+                f.write(response or "")
+        except Exception:
+            pass
+
+        if not response:
+            return None, 'Brak odpowiedzi z chomikuj'
+
+        # <globalId> belongs to the enclosing <DownloadFolder> and is the
+        # folder's own path (e.g. /Pepe2020/Ebooki), not the file's, so it is
+        # used whole. Each segment is sanitized separately; non-ASCII is kept
+        # so Polish folder names survive.
+        global_id_match = re.search(r'<globalId>(.*?)</globalId>', response)
+        path_prefix = ''
+        if global_id_match:
+            segments = []
+            for segment in html.unescape(global_id_match.group(1)).split('/'):
+                segment = re.sub(r'[<>:"|?*\\\x00-\x1f]', '_', segment).strip('. ')
+                if segment:
+                    segments.append(segment)
+            path_prefix = os.path.join(*segments) if segments else ''
+
+        # Parse actual download URL from FileEntry.
+        # IMPORTANT: Match <name> tags ONLY inside <FileEntry>, not outer <DownloadFolder><name>.
+        # realId can be i:nil="true", so we ignore it and just pick:
+        #   - numeric id
+        #   - file name
+        #   - size
+        #   - optional url (may be nil)
+        file_pattern = re.compile(
+            r'<FileEntry[^>]*>.*?'
+            r'<id>(\d+)</id>.*?'
+            r'(?:<realId[^>]*/>|</realId>).*?'
+            r'<name>(.*?)</name><size>(\d+)</size>.*?'
+            r'(?:<url i:nil="true"\s*/>|<url>(.*?)</url>).*?'
+            r'</FileEntry>',
+            re.DOTALL
+        )
+
+        for fid, name, size, url_val in file_pattern.findall(response):
+            if not url_val:
+                # No direct download URL for this entry.
+                continue
+
+            # Sanitize filename: remove any XML-like tags that might have leaked in.
+            name = re.sub(r'<[^>]+>', '', name).strip()
+            # Remove any leading/trailing XML fragments.
+            name = re.sub(r'^[<>/]+', '', name)
+            name = re.sub(r'[<>/]+$', '', name)
+
+            # Sanitize filename for filesystem safety (remove invalid chars for macOS/Windows/Linux).
+            safe_name = re.sub(r'[<>:"|?*\x00-\x1f]', '_', name)
+            # Remove any leading dots or spaces that could cause issues.
+            safe_name = safe_name.lstrip('. ')
+
+            dest_dir = destination_folder
+            if self.args.structure and path_prefix:
+                dest_dir = os.path.join(destination_folder, path_prefix)
+
+            # Report progress under the listing name so the UI row matches.
+            return {
+                'name': file_info['name'],
+                'size': int(size),
+                'url': html.unescape(url_val),
+                'destination': os.path.join(dest_dir, safe_name)
+            }, None
+
+        return None, self._describe_missing_url(response)
+
+    def _describe_missing_url(self, response):
+        """Best-effort human-readable reason why no download URL was returned."""
+        for tag in ('errorMessage', 'message', 'status'):
+            for value in re.findall(rf'<(?:\w+:)?{tag}>([^<]+)</(?:\w+:)?{tag}>', response):
+                value = value.strip()
+                if value and value.lower() not in ('ok', 'success'):
+                    return f'Chomikuj nie zwrócił linku do pobrania ({value})'
+        return 'Chomikuj nie zwrócił linku do pobrania'
+
     def _download_binary(self, file_data):
-        """Helper to handle the actual curl/file write logic."""
+        """
+        Helper to handle the actual curl/file write logic.
+        Returns 'ok', 'skipped', 'error' or 'retry' (server answered with an
+        HTML page instead of the file; the caller decides whether to retry).
+        """
         url = file_data['url']
         dest = file_data['destination']
         size = file_data['size']
@@ -461,7 +507,8 @@ class ChomikDownloader:
         if os.path.exists(dest):
             if self.args.structure and not self.args.overwrite:
                 self.log("Already downloaded, skipping.")
-                return
+                self._notify(name, 'success', 'Plik już istnieje, pominięto', 100)
+                return 'skipped'
             
             if self.args.overwrite:
                 self.log("Will Overwrite. ", error=False)
@@ -495,7 +542,8 @@ class ChomikDownloader:
             else:
                 self.log("Already downloaded (part complete), skipping.")
                 os.rename(part_file, dest)
-                return
+                self._notify(name, 'success', 'Pobrano pomyślnie', 100)
+                return 'ok'
         else:
             self.log("Downloading... ", error=False)
 
@@ -510,7 +558,7 @@ class ChomikDownloader:
                             callback(name, 'error', '404 Not Found', None)
                         except Exception:
                             pass
-                    return
+                    return 'error'
                 # Reject HTML responses — chomikuj serves a fake "success" HTML
                 # error page (~14 KB) when the request is rejected for non-
                 # technical reasons (UA blocked, quota exhausted, login lost).
@@ -521,12 +569,7 @@ class ChomikDownloader:
                     self.log(f"ERROR: server returned HTML, not a file. Snippet: {snippet!r}", error=True)
                     if os.path.exists(part_file):
                         os.remove(part_file)
-                    if callback:
-                        try:
-                            callback(name, 'error', 'Serwer zwrócił HTML zamiast pliku', None)
-                        except Exception:
-                            pass
-                    return
+                    return 'retry'
                 total = int(r.headers.get('content-length', 0)) or size
                 written = existing_size if mode == 'ab' else 0
                 with open(part_file, mode) as f:
@@ -549,7 +592,7 @@ class ChomikDownloader:
                         callback(name, 'error', f'Niekompletne pobranie {written}/{size} B', None)
                     except Exception:
                         pass
-                return
+                return 'error'
             os.rename(part_file, dest)
             self.log("Done.")
             if callback:
@@ -557,6 +600,7 @@ class ChomikDownloader:
                     callback(name, 'success', 'Pobrano pomyślnie', 100)
                 except Exception:
                     pass
+            return 'ok'
         except Exception as e:
             self.log(f"ERROR: {e}", error=True)
             if callback:
@@ -564,6 +608,7 @@ class ChomikDownloader:
                     callback(name, 'error', str(e), None)
                 except Exception:
                     pass
+            return 'error'
 
 
     def _request(self, url, method='POST', data=None, headers=None):
