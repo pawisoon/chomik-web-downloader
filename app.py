@@ -45,6 +45,10 @@ MAX_JOBS = int(os.environ.get('MAX_JOBS', '50'))
 #   'done': bool, 'error': str|None, 'interrupted': bool }
 download_status = {}
 download_lock = threading.Lock()
+# Only one job talks to chomikuj at a time: the service withholds download
+# links while the same account is already streaming a file, and parallel jobs
+# on the same folder would also race on the same .part files.
+job_runner_lock = threading.Lock()
 
 _state_initialized = False
 
@@ -395,6 +399,7 @@ HTML_FORM = u"""
             white-space: nowrap;
         }
         .status-badge.running { background: #e3f2fd; color: #1565c0; }
+        .status-badge.queued { background: #eceff1; color: #455a64; }
         .status-badge.done { background: #d4edda; color: #155724; }
         .status-badge.error { background: #f8d7da; color: #721c24; }
         .status-badge.interrupted { background: #fff3cd; color: #856404; }
@@ -497,6 +502,7 @@ HTML_FORM = u"""
             return String(iso).replace('T', ' ').slice(0, 19);
         }
         function jobState(job) {
+            if (!job.done && job.queued) return { cls: 'queued', text: 'W kolejce' };
             if (!job.done) return { cls: 'running', text: 'W toku' };
             if (job.interrupted) return { cls: 'interrupted', text: 'Przerwane' };
             if (job.error) return { cls: 'error', text: 'Błąd' };
@@ -744,6 +750,7 @@ def api_download():
                     'created_at': datetime.now().isoformat(),
                     'files': [],
                     'done': False,
+                    'queued': True,
                     'error': None,
                     'interrupted': False,
                 })
@@ -758,6 +765,7 @@ def api_download():
                     'created_at': datetime.now().isoformat(),
                     'files': [],
                     'done': False,
+                    'queued': True,
                     'error': None,
                     'interrupted': False,
                 }
@@ -803,7 +811,13 @@ def api_download():
         args.on_files_listed = on_files_listed
 
         def run():
+            job_runner_lock.acquire()
             try:
+                with download_lock:
+                    st = download_status.get(job_id)
+                    if st:
+                        st['queued'] = False
+                        persist_state()
                 d = ChomikDownloader(args)
                 d.download_files([url], dest_path)
             except Exception as e:
@@ -813,6 +827,8 @@ def api_download():
                         st['error'] = str(e)
                         st['done'] = True
                         persist_state()
+            finally:
+                job_runner_lock.release()
             with download_lock:
                 st = download_status.get(job_id)
                 if st:
