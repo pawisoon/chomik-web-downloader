@@ -492,8 +492,10 @@ HTML_FORM = u"""
             el.textContent = msg;
             document.getElementById('messages').appendChild(el);
         }
-        function slug(name) { return name.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 40); }
-        function fileElId(jobId, name) { return 'j-' + jobId + '-s-' + slug(name); }
+        // Full, injective encoding of the name: files in one folder often share
+        // a long common prefix, so a truncated slug would collapse them into one
+        // row. encodeURIComponent never emits ':', so ':p'/':t' suffixes are safe.
+        function fileElId(jobId, name) { return 'j-' + jobId + ':' + encodeURIComponent(name); }
         function fmtSize(size) {
             return size >= 1024*1024 ? (size/1024/1024).toFixed(2) + ' MB' : (size/1024).toFixed(2) + ' KB';
         }
@@ -569,8 +571,8 @@ HTML_FORM = u"""
             div.id = id;
             div.innerHTML = '<div class="file-name">' + escapeHtml(name) + '</div>' +
                 '<div class="file-size">Rozmiar: ' + fmtSize(size) + '</div>' +
-                '<div class="progress-bar"><div class="progress-fill" id="' + id + '-p">0%</div></div>' +
-                '<div class="status-text status-pending" id="' + id + '-t">Oczekiwanie...</div>';
+                '<div class="progress-bar"><div class="progress-fill" id="' + id + ':p">0%</div></div>' +
+                '<div class="status-text status-pending" id="' + id + ':t">Oczekiwanie...</div>';
             const container = document.getElementById('files-' + jobId);
             if (container) container.appendChild(div);
         }
@@ -578,8 +580,8 @@ HTML_FORM = u"""
             const id = fileElId(jobId, name);
             const el = document.getElementById(id);
             if (!el) return;
-            const p = document.getElementById(id + '-p');
-            const t = document.getElementById(id + '-t');
+            const p = document.getElementById(id + ':p');
+            const t = document.getElementById(id + ':t');
             if (p) { p.style.width = (percent != null ? percent : 0) + '%'; p.textContent = (percent != null ? percent + '%' : '0%'); }
             if (t) t.textContent = message;
             el.className = 'file-item ' + (status === 'success' ? 'success' : status === 'error' ? 'error' : 'pending');
