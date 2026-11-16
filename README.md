@@ -172,3 +172,10 @@ Safe to delete at any time.
 
 - Python 3.8+
 - `flask` and `requests` (see `requirements.txt`)
+
+## Support
+
+If this tool saves you time, you can buy me a coffee:
+
+<a href="https://suppi.pl/pawels"><img src="https://img.shields.io/badge/Suppi-Wesprzyj-ff5a5f?style=for-the-badge" alt="Suppi" height="40"></a>
+<a href="https://buymeacoffee.com/pawisoon"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Buy Me a Coffee" height="40"></a>

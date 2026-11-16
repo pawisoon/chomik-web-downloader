@@ -683,6 +683,15 @@ HTML_FORM = u"""
         }
         document.addEventListener('DOMContentLoaded', loadJobs);
     </script>
+
+    <section class="support-box" style="margin:32px auto 8px;max-width:760px;text-align:center;padding:28px 20px;border-radius:14px;background:linear-gradient(135deg,#fff7e0,#ffe9ec);box-shadow:0 2px 12px rgba(0,0,0,.08);font-family:Arial,sans-serif">
+        <h2 style="margin:0 0 8px;font-size:22px;color:#333">Podoba Ci się to narzędzie?</h2>
+        <p style="margin:0 0 20px;color:#555;font-size:15px">Jest darmowe i open source. Jeśli oszczędza Ci czas, postaw mi kawę.</p>
+        <div style="display:flex;flex-wrap:wrap;gap:14px;justify-content:center">
+            <a href="https://suppi.pl/pawels" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:10px;padding:16px 30px;border-radius:12px;background:#ff5a5f;color:#fff;font-size:18px;font-weight:bold;text-decoration:none;box-shadow:0 3px 10px rgba(255,90,95,.35)">&#10084; Wesprzyj na Suppi</a>
+            <a href="https://buymeacoffee.com/pawisoon" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:10px;padding:16px 30px;border-radius:12px;background:#ffdd00;color:#111;font-size:18px;font-weight:bold;text-decoration:none;box-shadow:0 3px 10px rgba(255,221,0,.45)">&#9749; Buy Me a Coffee</a>
+        </div>
+    </section>
 </body>
 </html>
 """
